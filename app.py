@@ -1,4 +1,3 @@
-import json
 import os
 from datetime import datetime, timezone
 
@@ -7,13 +6,20 @@ import streamlit as st
 
 st.set_page_config(page_title="Anti-MEV Shield", page_icon="🛡️", layout="wide")
 
-PUBLIC_RPC_DEFAULT = "https://cloudflare-eth.com"
-PRIVATE_RPC_DEFAULT = "https://rpc.flashbots.net"
-REQUEST_TIMEOUT = 12
+PUBLIC_RPC_DEFAULT = "https://ethereum-rpc.publicnode.com"
+REQUEST_TIMEOUT = 15
+UNISWAP_V3_QUOTER_V2_ETH = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+QUOTER_V2_QUOTE_EXACT_INPUT_SINGLE_SELECTOR = "0xc6a5026a"
+
+TOKENS = {
+    "WETH": {"address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", "decimals": 18},
+    "USDC": {"address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", "decimals": 6},
+    "USDT": {"address": "0xdAC17F958D2ee523a2206206994597C13D831ec7", "decimals": 6},
+    "DAI": {"address": "0x6B175474E89094C44Da98b954EedeAC495271d0F", "decimals": 18},
+}
 
 
 def rpc_call(endpoint: str, method: str, params=None):
-    """Call a JSON-RPC endpoint. No wallet keys are used or stored."""
     if params is None:
         params = []
     response = requests.post(
@@ -25,9 +31,9 @@ def rpc_call(endpoint: str, method: str, params=None):
     response.raise_for_status()
     payload = response.json()
     if payload.get("error"):
-        raise RuntimeError(payload["error"].get("message", "JSON-RPC error"))
+        raise RuntimeError(payload["error"].get("message", str(payload["error"])))
     if "result" not in payload:
-        raise RuntimeError("The RPC response did not include a result.")
+        raise RuntimeError("RPC response did not contain a result.")
     return payload["result"]
 
 
@@ -40,217 +46,185 @@ def hex_int(value):
         return None
 
 
-def wei_to_eth(value):
-    number = hex_int(value)
-    return number / 10**18 if number is not None else None
+def word(value: int) -> str:
+    return format(value, "064x")
 
 
-def risk_review(amount_usd, slippage_pct, price_impact_pct, path_status, quote_stale):
-    """Transparent review-priority heuristic, NOT an attack probability."""
-    score = 0
-    reasons = []
+def address_word(address: str) -> str:
+    clean = address.lower().removeprefix("0x")
+    if len(clean) != 40:
+        raise ValueError("Invalid EVM address length.")
+    int(clean, 16)
+    return clean.rjust(64, "0")
 
-    if amount_usd >= 100_000:
-        score += 20
-        reasons.append("High estimated transaction value (≥ $100,000)")
-    elif amount_usd >= 25_000:
-        score += 10
-        reasons.append("Elevated estimated transaction value (≥ $25,000)")
 
-    if slippage_pct >= 3:
-        score += 25
-        reasons.append("High slippage tolerance (≥ 3%)")
-    elif slippage_pct >= 1.5:
-        score += 15
-        reasons.append("Elevated slippage tolerance (≥ 1.5%)")
+def encode_quote(token_in, token_out, fee, amount_in):
+    # ABI-encode QuoterV2's quoteExactInputSingle tuple parameter.
+    tuple_data = (
+        address_word(token_in)
+        + address_word(token_out)
+        + word(amount_in)
+        + word(fee)
+        + word(0)
+    )
+    # This tuple is fully static, so ABI encoding is inline (no offset word).
+    return QUOTER_V2_QUOTE_EXACT_INPUT_SINGLE_SELECTOR + tuple_data
 
-    if price_impact_pct >= 5:
-        score += 25
-        reasons.append("High estimated price impact (≥ 5%)")
-    elif price_impact_pct >= 2:
-        score += 15
-        reasons.append("Elevated estimated price impact (≥ 2%)")
 
-    if path_status == "Public mempool":
-        score += 15
-        reasons.append("Transaction path is marked as public")
-    elif path_status == "Unknown / not verified":
-        score += 5
-        reasons.append("Submission path has not been verified")
+def quote_swap(rpc, token_in, token_out, amount_in_raw, fee):
+    data = encode_quote(token_in, token_out, fee, amount_in_raw)
+    result = rpc_call(
+        rpc,
+        "eth_call",
+        [{"to": UNISWAP_V3_QUOTER_V2_ETH, "data": data}, "latest"],
+    )
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise RuntimeError("Unexpected quote response.")
+    raw = result[2:]
+    if len(raw) < 64 * 4:
+        raise RuntimeError("The pool may not exist at this fee tier, or the RPC returned an unexpected quote.")
+    words = [raw[i:i+64] for i in range(0, 64 * 4, 64)]
+    return {
+        "amount_out_raw": int(words[0], 16),
+        "initialized_ticks_crossed": int(words[2], 16),
+        "gas_estimate": int(words[3], 16),
+    }
 
-    if quote_stale:
-        score += 10
-        reasons.append("Quote may be stale; refresh it before proceeding")
 
-    score = min(score, 100)
-    if score < 20:
-        label = "Lower review priority"
-    elif score < 45:
-        label = "Moderate review priority"
-    elif score < 70:
-        label = "High review priority"
-    else:
-        label = "Very high review priority"
-
-    if not reasons:
-        reasons.append("No configured heuristic threshold was triggered")
-    return score, label, reasons
+def fmt_num(n, decimals=8):
+    return f"{n:,.{decimals}f}"
 
 
 st.title("🛡️ Anti-MEV Shield")
-st.caption("Ethereum transaction risk review • Private-route readiness • No wallet keys collected")
+st.caption("Ethereum swap review prototype • Read-only quote • No wallet keys collected")
 
 st.warning(
-    "This version reads live Ethereum RPC data and performs a transparent heuristic review. "
-    "It does not guarantee MEV prevention. Private submission is not executed by this app yet; "
-    "a wallet-signing integration and end-to-end testing are required."
+    "This version requests a read-only Uniswap V3 quote from Ethereum Mainnet. "
+    "It does not connect a wallet, sign or send transactions, continuously monitor the pending mempool, "
+    "or guarantee MEV prevention."
 )
 
 with st.sidebar:
-    st.header("Network connections")
-    public_rpc = st.text_input(
-        "Ethereum read RPC endpoint",
+    st.header("Ethereum connection")
+    rpc_url = st.text_input(
+        "Ethereum RPC endpoint",
         value=os.getenv("ETH_RPC_URL", PUBLIC_RPC_DEFAULT),
-        help="Used for reading public Ethereum data. Do not put wallet secrets here.",
+        help="Read-only RPC endpoint. Never enter a seed phrase or private key here.",
     )
-    private_rpc = st.text_input(
-        "Private submission endpoint",
-        value=os.getenv("ETH_PRIVATE_RPC_URL", PRIVATE_RPC_DEFAULT),
-        help="Endpoint address only. This version checks connectivity but does not submit transactions.",
-    )
-    st.caption("Never enter a seed phrase, private key, or wallet password into this app.")
+    st.caption("Never enter a seed phrase, private key, or wallet password.")
 
-tab_review, tab_live, tab_route = st.tabs(
-    ["Risk review", "Live Ethereum data", "Private-route readiness"]
+tab_swap, tab_health, tab_limits = st.tabs(
+    ["Swap review", "Connection check", "What this version does"]
 )
 
-with tab_review:
-    st.subheader("Review transaction conditions")
+with tab_swap:
+    st.subheader("Get a live indicative swap quote")
+    st.write(
+        "Request an indicative Uniswap V3 quote for common Ethereum tokens. "
+        "This is not a transaction preview and does not guarantee the amount received."
+    )
+    left, right = st.columns(2)
+    with left:
+        token_in_symbol = st.selectbox("You pay", ["WETH", "USDC", "USDT", "DAI"], index=0)
+        token_in = TOKENS[token_in_symbol]
+        amount_in = st.number_input(
+            f"Amount of {token_in_symbol}",
+            min_value=0.000001,
+            value=0.1 if token_in_symbol == "WETH" else 100.0,
+            step=0.1,
+            format="%.6f",
+        )
+    with right:
+        outputs = [symbol for symbol in TOKENS if symbol != token_in_symbol]
+        default_out = "USDC" if "USDC" in outputs else outputs[0]
+        token_out_symbol = st.selectbox("You receive", outputs, index=outputs.index(default_out))
+        token_out = TOKENS[token_out_symbol]
+        fee_tier = st.selectbox(
+            "Uniswap V3 pool fee tier",
+            options=[100, 500, 3000, 10000],
+            format_func=lambda x: {100: "0.01%", 500: "0.05%", 3000: "0.30%", 10000: "1.00%"}[x],
+            index=2,
+        )
+
+    st.subheader("Review settings")
     c1, c2 = st.columns(2)
     with c1:
-        amount_usd = st.number_input(
-            "Estimated transaction value (USD)",
-            min_value=0.0, value=25000.0, step=1000.0, format="%.2f"
-        )
         slippage_pct = st.number_input(
-            "Slippage tolerance (%)", min_value=0.0, max_value=100.0,
-            value=1.0, step=0.1, format="%.2f"
-        )
-    with c2:
-        price_impact_pct = st.number_input(
-            "Estimated price impact (%)", min_value=0.0, max_value=100.0,
+            "Slippage tolerance (%)", min_value=0.1, max_value=50.0,
             value=0.5, step=0.1, format="%.2f"
         )
-        path_status = st.selectbox(
-            "Submission path",
-            ["Unknown / not verified", "Public mempool", "Private route verified by user"]
-        )
-        quote_stale = st.checkbox("Quote may be stale / needs refreshing", value=False)
-
-    if st.button("Analyze risk", type="primary"):
-        score, label, reasons = risk_review(
-            amount_usd, slippage_pct, price_impact_pct, path_status, quote_stale
-        )
-        st.session_state["last_risk"] = {
-            "score": score, "label": label, "reasons": reasons,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-
-    if "last_risk" in st.session_state:
-        result = st.session_state["last_risk"]
-        st.metric("Review-priority score (not attack probability)", f'{result["score"]}/100')
-        st.progress(result["score"] / 100)
-        st.subheader(result["label"])
-        st.write("Reasons:")
-        for reason in result["reasons"]:
-            st.write(f"- {reason}")
-        st.caption(f'Analysis time (UTC): {result["timestamp"]}')
-        st.info(
-            "This score is a simple review heuristic, not a machine-learning model and not proof "
-            "that an attack is happening. Confirm values using the actual swap quote and transaction."
+    with c2:
+        impact_threshold = st.number_input(
+            "Price-impact warning threshold (%)", min_value=0.1, max_value=50.0,
+            value=2.0, step=0.1, format="%.2f"
         )
 
-with tab_live:
-    st.subheader("Read live Ethereum data")
-    if st.button("Check Ethereum RPC connection"):
+    if st.button("Fetch live quote and review", type="primary"):
         try:
-            chain_id = hex_int(rpc_call(public_rpc, "eth_chainId"))
-            block_hex = rpc_call(public_rpc, "eth_blockNumber")
-            block_number = hex_int(block_hex)
+            chain_id = hex_int(rpc_call(rpc_url, "eth_chainId"))
             if chain_id != 1:
-                st.error(f"Connected endpoint returned chain ID {chain_id}; expected Ethereum Mainnet (1).")
-            else:
-                st.success("Connected to an endpoint reporting Ethereum Mainnet.")
-            st.metric("Chain ID", str(chain_id))
-            st.metric("Latest reported block", f"{block_number:,}" if block_number is not None else "Unknown")
-        except Exception as exc:
-            st.error(f"Could not read Ethereum RPC: {exc}")
-            st.caption("The endpoint may be unavailable, rate-limited, or require a different URL.")
-
-    st.divider()
-    tx_hash = st.text_input(
-        "Optional transaction hash",
-        placeholder="0x…",
-        help="A public transaction hash is not a private key."
-    )
-    if st.button("Look up transaction"):
-        if not tx_hash.startswith("0x") or len(tx_hash) != 66:
-            st.error("Enter a valid-looking 32-byte transaction hash (0x plus 64 hex characters).")
-        else:
-            try:
-                tx = rpc_call(public_rpc, "eth_getTransactionByHash", [tx_hash])
-                if tx is None:
-                    st.info("The endpoint did not find this transaction. It may be unknown to this node.")
-                else:
-                    block_num = hex_int(tx.get("blockNumber"))
-                    value_eth = wei_to_eth(tx.get("value"))
-                    gas_price_wei = hex_int(tx.get("gasPrice"))
-                    details = {
-                        "hash": tx.get("hash"),
-                        "from": tx.get("from"),
-                        "to": tx.get("to"),
-                        "nonce": hex_int(tx.get("nonce")),
-                        "value_eth": value_eth,
-                        "gas_price_gwei": gas_price_wei / 1e9 if gas_price_wei is not None else None,
-                        "block_number": block_num,
-                        "status_note": "A null block number commonly indicates the transaction is pending, if returned by this node."
-                    }
-                    st.json(details)
-                    st.caption(
-                        "RPC visibility varies by provider. This lookup is not a continuous mempool monitor "
-                        "and does not determine whether MEV occurred."
-                    )
-            except Exception as exc:
-                st.error(f"Transaction lookup failed: {exc}")
-
-with tab_route:
-    st.subheader("Private-route readiness")
-    st.write(
-        "A private RPC endpoint can reduce exposure to the public transaction path for supported "
-        "transaction types, but it cannot guarantee protection from every MEV strategy."
-    )
-    st.markdown(
-        "- The endpoint field below is only a connection setting.\n"
-        "- This version does **not** sign or submit a transaction.\n"
-        "- Do not paste signed raw transactions into this demo.\n"
-        "- The next integration step is a wallet-based signing flow with explicit user approval."
-    )
-    if st.button("Check private endpoint connection"):
-        try:
-            chain_id = hex_int(rpc_call(private_rpc, "eth_chainId"))
-            st.success(f"The endpoint responded to eth_chainId. Reported chain ID: {chain_id}")
-            if chain_id != 1:
-                st.warning("The endpoint did not report Ethereum Mainnet chain ID 1.")
-            st.caption(
-                "A successful RPC response only confirms that the endpoint answered. It does not prove "
-                "private delivery, inclusion, or MEV protection."
+                raise RuntimeError(f"This setup is for Ethereum Mainnet (chain ID 1); RPC reported {chain_id}.")
+            amount_in_raw = int(round(amount_in * (10 ** token_in["decimals"])))
+            quote = quote_swap(
+                rpc_url, token_in["address"], token_out["address"], amount_in_raw, fee_tier
             )
+            amount_out = quote["amount_out_raw"] / (10 ** token_out["decimals"])
+            minimum_out = amount_out * (1 - slippage_pct / 100)
+
+            st.success("Indicative quote retrieved from the configured Ethereum RPC.")
+            a, b, c = st.columns(3)
+            a.metric("Estimated output", f"{fmt_num(amount_out)} {token_out_symbol}")
+            b.metric("Minimum output at selected slippage", f"{fmt_num(minimum_out)} {token_out_symbol}")
+            c.metric("Quoter gas estimate", f'{quote["gas_estimate"]:,}')
+
+            st.info(
+                "Minimum output is calculated from this quote and your slippage setting. "
+                "It is not a guarantee. A real transaction also requires checking the actual router, route, "
+                "deadline, calldata, fees, and wallet confirmation."
+            )
+            if slippage_pct >= 3:
+                st.error("High slippage setting: review carefully before any real swap.")
+            elif slippage_pct >= 1.5:
+                st.warning("Elevated slippage setting: consider whether this tolerance is necessary.")
+
+            st.warning(
+                "Price impact is not independently calculated in this prototype because that requires "
+                "a reliable reference price and pool-state analysis. This quote alone is not a complete MEV risk check."
+            )
+            st.caption(f'Quote time (UTC): {datetime.now(timezone.utc).isoformat()}')
         except Exception as exc:
-            st.error(f"Private endpoint check failed: {exc}")
-            st.caption("The service may be unavailable, rate-limited, or may require another method.")
+            st.error(f"Could not fetch a live swap quote: {exc}")
+            st.caption(
+                "Possible causes: RPC restrictions, no pool at the selected fee tier, unsupported eth_call, "
+                "or provider rate limits. Try another fee tier or a different public RPC endpoint."
+            )
+
+with tab_health:
+    st.subheader("Check the Ethereum RPC")
+    if st.button("Check connection"):
+        try:
+            chain_id = hex_int(rpc_call(rpc_url, "eth_chainId"))
+            latest = hex_int(rpc_call(rpc_url, "eth_blockNumber"))
+            if chain_id == 1:
+                st.success("Connected to an endpoint reporting Ethereum Mainnet.")
+            else:
+                st.error(f"RPC reported chain ID {chain_id}; expected 1 for Ethereum Mainnet.")
+            st.metric("Chain ID", str(chain_id))
+            st.metric("Latest reported block", f"{latest:,}" if latest is not None else "Unknown")
+        except Exception as exc:
+            st.error(f"Connection check failed: {exc}")
+
+with tab_limits:
+    st.subheader("Current capabilities and limits")
+    st.markdown(
+        """
+- **Implemented:** RPC connection check and a read-only quote request against Uniswap V3 QuoterV2 for common Ethereum tokens.
+- **Quote results:** indicative output, simple minimum-output estimate based on chosen slippage, and Quoter gas estimate.
+- **Not implemented:** wallet connection, wallet-based signing, transaction submission, private relay integration, continuous pending-transaction monitoring, independent price-impact calculation, or MEV detection.
+- **No guarantee:** a private route may reduce public-mempool exposure for supported flows but cannot guarantee protection against every MEV strategy.
+- **Safety:** never enter a seed phrase or private key into this app. Do not submit a transaction based solely on this prototype.
+        """
+    )
 
 st.divider()
-st.caption(
-    "Safety: no wallet connection, no key storage, no signing, no transaction submission, "
-    "no continuous pending-transaction scanning, and no guarantee of preventing MEV."
-)
+st.caption("Anti-MEV Shield prototype • Read-only quote only • No signing or transaction submission")
