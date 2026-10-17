@@ -1,10 +1,10 @@
+import json
 import streamlit as st
 import requests
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
-import json
 
-st.set_page_config(page_title="Anti-MEV Shield V4.4", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Anti-MEV Shield V4.5", page_icon="🛡️", layout="wide")
 DEFAULT_RPC = "https://ethereum-rpc.publicnode.com"
 QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
 TOKENS = {
@@ -15,279 +15,249 @@ TOKENS = {
 }
 FEES = {"0.01%": 100, "0.05%": 500, "0.30%": 3000, "1.00%": 10000}
 
-st.title("🛡️ Anti-MEV Shield V4.4")
-st.caption("Read-only quote comparison, reference-data quality checks, quote-size sensitivity, and an exportable test report.")
-st.warning("Experimental proof of concept only. It does not connect to a wallet, sign or submit transactions, monitor the live mempool, use a private relay, or guarantee MEV prevention. Indicators are heuristic checks, not verified attack detection or a probability of attack.")
+def now_utc():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
+st.title("🛡️ Anti-MEV Shield V4.5")
+st.caption("Read-only quote comparison, quote-size sensitivity, heuristic indicators, and downloadable JSON test reports.")
+st.warning("Experimental proof of concept only. No wallet connection, signing, transaction submission, live mempool monitoring, private relay, or guaranteed MEV prevention. Heuristic indicators are not verified attack detection.")
 
 def rpc_call(url, method, params):
-    response = requests.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=20)
-    response.raise_for_status()
-    data = response.json()
+    r = requests.post(url, json={"jsonrpc":"2.0","id":1,"method":method,"params":params}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
     if "error" in data:
-        error = data["error"]
-        raise RuntimeError(f"RPC error {error.get('code', '')}: {error.get('message', str(error))}")
+        e = data["error"]
+        raise RuntimeError(f"RPC error {e.get('code','')}: {e.get('message',str(e))}")
     return data.get("result")
 
+def uint_word(v):
+    return int(v).to_bytes(32, "big").hex()
 
-def uint_word(value):
-    return int(value).to_bytes(32, "big").hex()
-
-
-def address_word(address):
-    address = address.lower().removeprefix("0x")
-    if len(address) != 40:
+def address_word(a):
+    a = a.lower().removeprefix("0x")
+    if len(a) != 40:
         raise ValueError("Invalid token address")
-    return address.rjust(64, "0")
-
+    return a.rjust(64, "0")
 
 def quote_calldata(token_in, token_out, fee, amount_raw):
     return "0xc6a5026a" + address_word(token_in) + address_word(token_out) + uint_word(amount_raw) + uint_word(fee) + uint_word(0)
-
 
 def decode_words(result):
     if not isinstance(result, str) or not result.startswith("0x"):
         raise RuntimeError(f"Unexpected RPC result: {result!r}")
     raw = result[2:]
     if len(raw) < 64 or len(raw) % 64:
-        raise RuntimeError("Unexpected QuoterV2 response; the pool may be unavailable or the call may have reverted.")
-    return [int(raw[i:i + 64], 16) for i in range(0, len(raw), 64)]
-
+        raise RuntimeError("Unexpected QuoterV2 response; pool may be unavailable or call reverted.")
+    return [int(raw[i:i+64], 16) for i in range(0, len(raw), 64)]
 
 def get_quote(rpc, token_in, token_out, fee, amount):
-    amount_raw = int(amount * (Decimal(10) ** TOKENS[token_in]["decimals"]))
-    if amount_raw <= 0:
-        raise ValueError("Amount is too small for the selected token precision.")
-    calldata = quote_calldata(TOKENS[token_in]["address"], TOKENS[token_out]["address"], fee, amount_raw)
-    result = rpc_call(rpc, "eth_call", [{"to": QUOTER_V2, "data": calldata}, "latest"])
-    words = decode_words(result)
+    raw_amount = int(amount * (Decimal(10) ** TOKENS[token_in]["decimals"]))
+    if raw_amount <= 0:
+        raise ValueError("Amount is too small for selected token precision.")
+    calldata = quote_calldata(TOKENS[token_in]["address"], TOKENS[token_out]["address"], fee, raw_amount)
+    words = decode_words(rpc_call(rpc, "eth_call", [{"to":QUOTER_V2,"data":calldata},"latest"]))
     output = Decimal(words[0]) / (Decimal(10) ** TOKENS[token_out]["decimals"])
-    gas_estimate = words[3] if len(words) > 3 else None
-    return output, gas_estimate
-
+    return output, (words[3] if len(words) > 3 else None)
 
 @st.cache_data(ttl=20, show_spinner=False)
 def reference_prices(ids):
-    response = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids": ",".join(ids), "vs_currencies": "usd"}, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-    prices = {item: float(data[item]["usd"]) for item in ids if item in data and "usd" in data[item]}
-    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return prices, fetched_at
+    r = requests.get("https://api.coingecko.com/api/v3/simple/price", params={"ids":",".join(ids),"vs_currencies":"usd"}, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    prices = {i: float(data[i]["usd"]) for i in ids if i in data and "usd" in data[i]}
+    return prices, now_utc()
 
-
-def assess(deviation, slippage, size_sensitivity):
-    score = 0
-    reasons = []
+def assess(deviation, slippage, sensitivity):
+    score, reasons = 0, []
     if abs(deviation) >= 5:
-        score += 45; reasons.append("Quote differs from the external reference snapshot by at least 5%.")
+        score += 45; reasons.append("Quote differs from reference snapshot by at least 5%.")
     elif abs(deviation) >= 2:
-        score += 25; reasons.append("Quote differs from the external reference snapshot by at least 2%.")
+        score += 25; reasons.append("Quote differs from reference snapshot by at least 2%.")
     elif abs(deviation) >= 1:
-        score += 10; reasons.append("Quote differs from the external reference snapshot by at least 1%.")
+        score += 10; reasons.append("Quote differs from reference snapshot by at least 1%.")
     else:
-        reasons.append("Quote deviation from the reference snapshot is below 1%.")
-
+        reasons.append("Quote deviation from reference snapshot is below 1%.")
     if slippage >= 3:
-        score += 25; reasons.append("Selected slippage tolerance is high (3% or more).")
+        score += 25; reasons.append("Selected slippage tolerance is 3% or more.")
     elif slippage >= 1:
         score += 12; reasons.append("Selected slippage tolerance is at least 1%.")
     else:
         reasons.append("Selected slippage tolerance is below 1%.")
-
-    if size_sensitivity is None:
+    if sensitivity is None:
         reasons.append("Quote-size sensitivity could not be calculated.")
-    elif size_sensitivity >= 5:
-        score += 25; reasons.append("Output-per-input changes by at least 5% across the quote-size probes.")
-    elif size_sensitivity >= 2:
-        score += 15; reasons.append("Output-per-input changes by at least 2% across the quote-size probes.")
-    elif size_sensitivity >= 1:
-        score += 8; reasons.append("Output-per-input changes by at least 1% across the quote-size probes.")
+    elif sensitivity >= 5:
+        score += 25; reasons.append("Output-per-input changes by at least 5% across probes.")
+    elif sensitivity >= 2:
+        score += 15; reasons.append("Output-per-input changes by at least 2% across probes.")
+    elif sensitivity >= 1:
+        score += 8; reasons.append("Output-per-input changes by at least 1% across probes.")
     else:
-        reasons.append("Quote-size sensitivity is below 1% across the tested probes.")
-
+        reasons.append("Quote-size sensitivity is below 1% across tested probes.")
     score = min(score, 100)
     label = "High indicator level" if score >= 50 else "Moderate indicator level" if score >= 25 else "Lower indicator level"
     return score, label, reasons
-
 
 with st.sidebar:
     st.header("Connection")
     rpc = st.text_input("Ethereum Mainnet RPC URL", DEFAULT_RPC)
     st.caption("Never enter a seed phrase or private key.")
-    if st.button("Test RPC connection", use_container_width=True):
+    if st.button("Test RPC connection", width="stretch"):
         try:
             chain = rpc_call(rpc.strip(), "eth_chainId", [])
             block = rpc_call(rpc.strip(), "eth_blockNumber", [])
-            if int(chain, 16) != 1:
-                st.error(f"Connected to chain ID {int(chain, 16)}; Ethereum Mainnet (1) is required.")
+            if int(chain,16) != 1:
+                st.error(f"Connected to chain ID {int(chain,16)}; Ethereum Mainnet (1) is required.")
             else:
-                st.success(f"Connected • Ethereum Mainnet • Block {int(block, 16):,}")
-        except Exception as exc:
-            st.error(f"Connection failed: {exc}")
+                st.success(f"Connected • Ethereum Mainnet • Block {int(block,16):,}")
+        except Exception as e:
+            st.error(f"Connection failed: {e}")
 
 st.subheader("Uniswap V3 indicative quote")
-a, b, c = st.columns(3)
-with a:
-    token_in = st.selectbox("Input token", list(TOKENS), index=0)
-with b:
-    token_out = st.selectbox("Output token", list(TOKENS), index=1)
-with c:
-    fee_label = st.selectbox("Pool fee tier", list(FEES), index=2)
+c1,c2,c3 = st.columns(3)
+with c1: token_in = st.selectbox("Input token", list(TOKENS), index=0)
+with c2: token_out = st.selectbox("Output token", list(TOKENS), index=1)
+with c3: fee_label = st.selectbox("Pool fee tier", list(FEES), index=2)
 amount_text = st.text_input("Input amount", "0.1")
 slippage = st.slider("Illustrative slippage tolerance (%)", 0.1, 5.0, 0.5, 0.1)
-run_analysis = st.button("Get quote & analyze", type="primary", use_container_width=True)
+run = st.button("Get quote & analyze", type="primary", width="stretch")
+if "last_report" not in st.session_state:
+    st.session_state.last_report = None
 
 if token_in == token_out:
     st.info("Choose two different tokens.")
-elif run_analysis:
+elif run:
+    report = {
+        "app":"Anti-MEV Shield", "version":"V4.5", "report_created_at_utc":now_utc(),
+        "status":"started",
+        "limitations":["Experimental proof of concept.","Read-only; no wallet connection, signing, or transaction submission.",
+                       "No live mempool monitoring or private relay.","Heuristic indicators are not verified attack detection and do not prove MEV prevention."],
+        "inputs":{"input_token":token_in,"output_token":token_out,"pool_fee_label":fee_label,
+                  "pool_fee_units":FEES[fee_label],"input_amount":amount_text,"slippage_tolerance_percent":slippage},
+        "quote":None,"quote_size_probes":[],"reference_comparison":None,"heuristic_indicators":None,"errors":[]
+    }
     try:
         amount = Decimal(amount_text)
-        if not amount.is_finite() or amount <= 0:
-            raise InvalidOperation
+        if not amount.is_finite() or amount <= 0: raise InvalidOperation
         if amount * (Decimal(10) ** TOKENS[token_in]["decimals"]) < 1:
-            raise ValueError("Amount is too small for the selected token precision.")
+            raise ValueError("Amount is too small for selected token precision.")
         clean_rpc = rpc.strip()
-        if not clean_rpc.startswith("https://"):
-            raise ValueError("Use an HTTPS Ethereum Mainnet RPC URL.")
-
+        if not clean_rpc.startswith("https://"): raise ValueError("Use an HTTPS Ethereum Mainnet RPC URL.")
         with st.spinner("Checking network and retrieving indicative quote..."):
-            chain = rpc_call(clean_rpc, "eth_chainId", [])
-            if int(chain, 16) != 1:
-                raise RuntimeError("RPC endpoint is not on Ethereum Mainnet (chain ID 1).")
-            output, gas = get_quote(clean_rpc, token_in, token_out, FEES[fee_label], amount)
-            quote_time = datetime.now(timezone.utc)
-            minimum = output * (Decimal(1) - Decimal(str(slippage)) / Decimal(100))
-
-        st.success("Indicative quote retrieved from the configured Ethereum RPC.")
-        st.caption(f"Quote fetched at {quote_time.strftime('%Y-%m-%d %H:%M:%S UTC')} • Latest state queried; not a guaranteed execution price.")
-        x, y, z = st.columns(3)
-        x.metric("Estimated output", f"{output:,.8f} {token_out}")
-        y.metric("Illustrative minimum output", f"{minimum:,.8f} {token_out}")
-        z.metric("Quoter gas estimate", f"{gas:,}" if gas is not None else "Unavailable")
+            chain = rpc_call(clean_rpc,"eth_chainId",[])
+            if int(chain,16) != 1: raise RuntimeError("RPC endpoint is not on Ethereum Mainnet (chain ID 1).")
+            block = int(rpc_call(clean_rpc,"eth_blockNumber",[]),16)
+            output, gas = get_quote(clean_rpc,token_in,token_out,FEES[fee_label],amount)
+            quote_time = now_utc()
+            minimum = output * (Decimal(1)-Decimal(str(slippage))/Decimal(100))
+        report["status"] = "quote_succeeded"
+        report["network"] = {"name":"Ethereum Mainnet","chain_id":1,"block_number":block}
+        report["quote"] = {"retrieved_at_utc":quote_time,"estimated_output":str(output),"output_token":token_out,
+                           "illustrative_minimum_output":str(minimum),"quoter_gas_estimate":gas,"execution_price_guaranteed":False}
+        st.success("Indicative quote retrieved from configured Ethereum RPC.")
+        st.caption(f"Quote fetched at {quote_time} • Not a guaranteed execution price.")
+        m1,m2,m3 = st.columns(3)
+        m1.metric("Estimated output",f"{output:,.8f} {token_out}")
+        m2.metric("Illustrative minimum output",f"{minimum:,.8f} {token_out}")
+        m3.metric("Quoter gas estimate",f"{gas:,}" if gas is not None else "Unavailable")
 
         st.subheader("Quote-size sensitivity (read-only probes)")
-        probe_rows = []
-        size_sensitivity = None
-        probe_error = None
+        sensitivity = None
         try:
+            probe_amounts = [amount/Decimal(10), amount, amount*Decimal(10)]
+            probes = []
             with st.spinner("Comparing smaller, current, and larger quote sizes..."):
-                probe_amounts = [amount / Decimal(10), amount, amount * Decimal(10)]
-                probe_rates = []
-                for probe_amount in probe_amounts:
-                    probe_output, _ = get_quote(clean_rpc, token_in, token_out, FEES[fee_label], probe_amount)
-                    rate = probe_output / probe_amount
-                    probe_rates.append(rate)
-                    probe_rows.append({"Input amount": f"{probe_amount.normalize():f} {token_in}", "Estimated output": f"{probe_output:.8f} {token_out}", "Output per input unit": f"{rate:.8f} {token_out}/{token_in}"})
-            rates = [float(rate) for rate in probe_rates]
-            baseline = rates[1]
-            if baseline > 0:
-                size_sensitivity = (max(rates) - min(rates)) / baseline * 100
-            st.dataframe(probe_rows, use_container_width=True, hide_index=True)
-            st.metric("Variation in output per input across probes", f"{size_sensitivity:.3f}%" if size_sensitivity is not None else "Unavailable")
-            st.caption("This is a quote-size sensitivity signal from three RPC quotes, not an independently verified price-impact or MEV measurement. It compares output-per-input across the tested sizes using the same token pair and fee tier.")
-        except Exception as exc:
-            probe_error = str(exc)
-            st.warning(f"Quote succeeded, but size-sensitivity probes were incomplete: {probe_error}")
+                for pa in probe_amounts:
+                    po, pg = get_quote(clean_rpc,token_in,token_out,FEES[fee_label],pa)
+                    probes.append({"input_amount":str(pa),"input_token":token_in,"estimated_output":str(po),
+                                   "output_token":token_out,"output_per_input_unit":str(po/pa),"quoter_gas_estimate":pg})
+            rates = [Decimal(p["output_per_input_unit"]) for p in probes]
+            sensitivity = float((max(rates)-min(rates))/rates[1]*Decimal(100)) if rates[1] > 0 else None
+            report["quote_size_probes"] = probes
+            report["quote_size_sensitivity_percent"] = sensitivity
+            st.dataframe([{"Input amount":f"{Decimal(p['input_amount']).normalize():f} {token_in}",
+                           "Estimated output":f"{Decimal(p['estimated_output']):.8f} {token_out}",
+                           "Output per input unit":f"{Decimal(p['output_per_input_unit']):.8f} {token_out}/{token_in}"} for p in probes],
+                         width="stretch",hide_index=True)
+            st.metric("Variation in output per input across probes",f"{sensitivity:.3f}%" if sensitivity is not None else "Unavailable")
+            st.caption("Sensitivity across three RPC quotes only; not an independently verified price-impact or MEV measurement.")
+        except Exception as e:
+            report["errors"].append({"stage":"quote_size_probes","message":str(e),"occurred_at_utc":now_utc()})
+            st.warning(f"Quote succeeded, but size-sensitivity probes were incomplete: {e}")
 
         try:
             with st.spinner("Fetching external reference prices..."):
-                ids = sorted({TOKENS[token_in]["id"], TOKENS[token_out]["id"]})
-                prices, reference_time = reference_prices(ids)
-                in_id, out_id = TOKENS[token_in]["id"], TOKENS[token_out]["id"]
-                if in_id not in prices or out_id not in prices:
-                    raise RuntimeError("External reference price unavailable for one or both tokens.")
-                input_price, output_price = prices[in_id], prices[out_id]
-                expected = float(amount) * input_price / output_price
-                if expected <= 0:
-                    raise RuntimeError("Reference output is not positive.")
-                deviation = (float(output) - expected) / expected * 100
+                ids = sorted({TOKENS[token_in]["id"],TOKENS[token_out]["id"]})
+                prices, ref_time = reference_prices(ids)
+                in_id,out_id = TOKENS[token_in]["id"],TOKENS[token_out]["id"]
+                if in_id not in prices or out_id not in prices: raise RuntimeError("External reference price unavailable.")
+                in_price,out_price = prices[in_id],prices[out_id]
+                expected = float(amount)*in_price/out_price
+                if expected <= 0: raise RuntimeError("Reference output is not positive.")
+                deviation = (float(output)-expected)/expected*100
+            score,label,reasons = assess(deviation,slippage,sensitivity)
+            report["reference_comparison"] = {"provider":"CoinGecko simple price API","retrieved_at_utc":ref_time,
+                "input_token_usd_price":in_price,"output_token_usd_price":out_price,"approx_reference_output":expected,
+                "quote_deviation_percent":deviation,"market_observation_timestamp_provided":False,
+                "note":"Retrieval time is not a market-observation timestamp; data may be cached."}
+            report["heuristic_indicators"] = {"score_out_of_100":score,"label":label,"reasons":reasons,"verified_attack_detection":False}
+            report["status"] = "analysis_completed" if not report["errors"] else "analysis_completed_with_warnings"
             st.subheader("External reference-price comparison")
-            p, q, r = st.columns(3)
-            p.metric("Approx. reference output", f"{expected:,.8f} {token_out}")
-            q.metric("Quote deviation", f"{deviation:+.3f}%")
-            r.metric("Reference prices", f"${input_price:,.4f} / ${output_price:,.4f}")
-            st.caption(f"Reference prices retrieved at {reference_time}. The provider response used here does not supply a market-observation timestamp; this is retrieval time only. Results may be cached for up to 20 seconds.")
-            st.subheader("Reference-data quality checks")
-            quality_notes = []
-            if input_price <= 0 or output_price <= 0:
-                quality_notes.append("Reference price is zero or negative; do not rely on this comparison.")
-                st.error(quality_notes[-1])
-            elif abs(deviation) >= 5:
-                quality_notes.append("Quote/reference difference is 5% or more. Verify token mapping, pool route, liquidity, and reference data before interpreting it.")
-                st.warning(quality_notes[-1])
-            elif abs(deviation) >= 2:
-                quality_notes.append("Quote/reference difference is 2% or more. This may reflect market movement, fees, liquidity, or reference-data mismatch.")
-                st.warning(quality_notes[-1])
-            else:
-                quality_notes.append("Reference values are positive and quote/reference difference is below 2%; this is a consistency check, not proof that either price is correct.")
-                st.info(quality_notes[-1])
-            score, label, reasons = assess(deviation, slippage, size_sensitivity)
+            a,b,c = st.columns(3)
+            a.metric("Approx. reference output",f"{expected:,.8f} {token_out}")
+            b.metric("Quote deviation",f"{deviation:+.3f}%")
+            c.metric("Reference prices",f"${in_price:,.4f} / ${out_price:,.4f}")
+            st.caption(f"Reference prices retrieved at {ref_time}; this is retrieval time, not a guarantee of real-time data.")
             st.subheader("Pre-trade heuristic indicators")
-            st.metric("Heuristic indicator score", f"{score}/100", label)
-            if score >= 50:
-                st.error("Several indicators warrant extra review. This is not a verified threat alert.")
-            elif score >= 25:
-                st.warning("Review reference price, pool liquidity, fee tier, quote-size sensitivity, and slippage settings.")
-            else:
-                st.info("The simple indicators are relatively low for this snapshot; this is not a safety guarantee.")
+            st.metric("Heuristic indicator score",f"{score}/100",label)
+            if score >= 50: st.error("Several indicators warrant extra review. Not a verified threat alert.")
+            elif score >= 25: st.warning("Review reference price, liquidity, fee tier, sensitivity, and slippage.")
+            else: st.info("Indicators are relatively low for this snapshot; not a safety guarantee.")
             st.write("**Reasons considered**")
-            for reason in reasons:
-                st.write("- " + reason)
-            st.caption("V4.4 uses reference-price deviation, selected slippage, and quote-size sensitivity only. Reference-data checks are sanity checks, not independent validation. It does not inspect liquidity depth directly, pending transactions, sandwich patterns, private order flow, or attack probability.")
-            report = {
-                "version": "V4.4",
-                "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                "pair": f"{token_in}->{token_out}",
-                "pool_fee_tier": fee_label,
-                "input_amount": str(amount),
-                "slippage_percent": slippage,
-                "estimated_output": str(output),
-                "output_token": token_out,
-                "illustrative_minimum_output": str(minimum),
-                "quoter_gas_estimate": gas,
-                "quote_fetched_at_utc": quote_time.isoformat(timespec="seconds"),
-                "reference_retrieved_at_utc": reference_time,
-                "reference_prices_usd": {token_in: input_price, token_out: output_price},
-                "approx_reference_output": expected,
-                "quote_deviation_percent": deviation,
-                "quote_size_sensitivity_percent": size_sensitivity,
-                "heuristic_score": score,
-                "heuristic_label": label,
-                "reference_quality_notes": quality_notes,
-                "limitations": ["No wallet connection", "No transaction signing or submission", "No live mempool monitoring", "No verified MEV attack detection or prevention", "Reference timestamp is retrieval time, not market-observation time"]
-            }
-            st.download_button("Download test report (JSON)", data=json.dumps(report, indent=2), file_name="anti_mev_v4_4_test_report.json", mime="application/json")
-        except Exception as exc:
-            st.warning(f"Quote and size probes succeeded, but external-reference indicators could not be calculated: {exc}")
+            for reason in reasons: st.write("- "+reason)
+        except Exception as e:
+            report["errors"].append({"stage":"reference_price_comparison","message":str(e),"occurred_at_utc":now_utc()})
+            report["status"] = "quote_succeeded_analysis_incomplete"
+            st.warning(f"Quote succeeded, but external-reference indicators could not be calculated: {e}")
+    except (InvalidOperation, ValueError, OverflowError) as e:
+        report["status"] = "input_or_validation_error"
+        report["errors"].append({"stage":"validation","message":str(e),"occurred_at_utc":now_utc()})
+        st.error(f"Enter a valid positive amount and valid HTTPS RPC URL. Details: {e}")
+    except Exception as e:
+        report["status"] = "quote_failed"
+        report["errors"].append({"stage":"quote","message":str(e),"occurred_at_utc":now_utc()})
+        st.error(f"Quote request failed: {e}")
+        st.caption("Check RPC endpoint, selected pair, and whether the fee-tier pool exists.")
+    report["report_updated_at_utc"] = now_utc()
+    st.session_state.last_report = report
 
-        st.subheader("Interpretation")
-        st.write("V4.4 adds reference-data sanity checks, an exportable JSON test report, quote-size sensitivity, and retrieval timestamps. It remains a transparent rule-based prototype, not AI-based detection. It does not submit transactions or prove MEV prevention.")
-        st.caption(f"Pair: {token_in} → {token_out} • Fee tier: {fee_label} • Slippage: {slippage:.1f}%")
-    except (InvalidOperation, ValueError, OverflowError) as exc:
-        st.error(f"Enter a valid positive amount and valid HTTPS RPC URL. Details: {exc}")
-    except Exception as exc:
-        st.error(f"Quote request failed: {exc}")
-        st.caption("Check the detailed error, RPC endpoint, selected pair, and whether the fee-tier pool exists.")
+if st.session_state.last_report is not None:
+    st.divider()
+    st.subheader("Download test report")
+    st.caption("Report reflects the latest analysis run in this session, including errors or incomplete stages.")
+    st.download_button("⬇️ Download JSON Report",
+        data=json.dumps(st.session_state.last_report,indent=2,ensure_ascii=False),
+        file_name=f"anti_mev_shield_v4_5_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json",
+        mime="application/json",width="stretch")
+    with st.expander("Preview JSON report"):
+        st.json(st.session_state.last_report)
 
 st.divider()
 st.subheader("Read-only transaction lookup (optional)")
-tx_hash = st.text_input("Ethereum transaction hash", placeholder="0x…")
-if st.button("Inspect transaction", use_container_width=True):
-    clean_hash = tx_hash.strip()
-    if len(clean_hash) != 66 or not clean_hash.startswith("0x") or any(char not in "0123456789abcdefABCDEF" for char in clean_hash[2:]):
+tx_hash = st.text_input("Ethereum transaction hash",placeholder="0x…")
+if st.button("Inspect transaction",width="stretch"):
+    h = tx_hash.strip()
+    if len(h)!=66 or not h.startswith("0x") or any(ch not in "0123456789abcdefABCDEF" for ch in h[2:]):
         st.error("Enter a transaction hash: 0x followed by 64 hexadecimal characters.")
     else:
         try:
-            tx = rpc_call(rpc.strip(), "eth_getTransactionByHash", [clean_hash])
-            receipt = rpc_call(rpc.strip(), "eth_getTransactionReceipt", [clean_hash])
-            if not tx:
-                st.warning("Transaction not found by this RPC.")
+            tx = rpc_call(rpc.strip(),"eth_getTransactionByHash",[h])
+            receipt = rpc_call(rpc.strip(),"eth_getTransactionReceipt",[h])
+            if not tx: st.warning("Transaction not found by this RPC.")
             else:
-                st.json({"hash": tx.get("hash"), "from": tx.get("from"), "to": tx.get("to"), "value_wei": tx.get("value"), "block_number": tx.get("blockNumber"), "receipt_status": receipt.get("status") if receipt else "pending or unavailable"})
+                st.json({"hash":tx.get("hash"),"from":tx.get("from"),"to":tx.get("to"),"value_wei":tx.get("value"),
+                         "block_number":tx.get("blockNumber"),"receipt_status":receipt.get("status") if receipt else "pending or unavailable"})
                 st.caption("Read-only RPC data only; not a full security audit.")
-        except Exception as exc:
-            st.error(f"Transaction lookup failed: {exc}")
-
+        except Exception as e: st.error(f"Transaction lookup failed: {e}")
 st.divider()
-st.caption("Anti-MEV Shield V4.4 • Experimental proof of concept • No wallet connection, signing, transaction submission, private relay, or guaranteed MEV protection.")
+st.caption("Anti-MEV Shield V4.5 • Experimental proof of concept • No wallet connection, signing, transaction submission, private relay, or guaranteed MEV protection.")
