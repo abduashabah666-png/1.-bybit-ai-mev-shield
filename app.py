@@ -2,8 +2,9 @@ import streamlit as st
 import requests
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
+import json
 
-st.set_page_config(page_title="Anti-MEV Shield V4.3", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Anti-MEV Shield V4.4", page_icon="🛡️", layout="wide")
 DEFAULT_RPC = "https://ethereum-rpc.publicnode.com"
 QUOTER_V2 = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
 TOKENS = {
@@ -14,8 +15,8 @@ TOKENS = {
 }
 FEES = {"0.01%": 100, "0.05%": 500, "0.30%": 3000, "1.00%": 10000}
 
-st.title("🛡️ Anti-MEV Shield V4.3")
-st.caption("Read-only quote comparison, reference-price timestamp, and quote-size sensitivity indicators.")
+st.title("🛡️ Anti-MEV Shield V4.4")
+st.caption("Read-only quote comparison, reference-data quality checks, quote-size sensitivity, and an exportable test report.")
 st.warning("Experimental proof of concept only. It does not connect to a wallet, sign or submit transactions, monitor the live mempool, use a private relay, or guarantee MEV prevention. Indicators are heuristic checks, not verified attack detection or a probability of attack.")
 
 
@@ -172,17 +173,19 @@ elif run_analysis:
         try:
             with st.spinner("Comparing smaller, current, and larger quote sizes..."):
                 probe_amounts = [amount / Decimal(10), amount, amount * Decimal(10)]
+                probe_rates = []
                 for probe_amount in probe_amounts:
                     probe_output, _ = get_quote(clean_rpc, token_in, token_out, FEES[fee_label], probe_amount)
                     rate = probe_output / probe_amount
+                    probe_rates.append(rate)
                     probe_rows.append({"Input amount": f"{probe_amount.normalize():f} {token_in}", "Estimated output": f"{probe_output:.8f} {token_out}", "Output per input unit": f"{rate:.8f} {token_out}/{token_in}"})
-            rates = [float(Decimal(row["Estimated output"].split()[0]) / Decimal(row["Input amount"].split()[0])) for row in probe_rows]
+            rates = [float(rate) for rate in probe_rates]
             baseline = rates[1]
             if baseline > 0:
                 size_sensitivity = (max(rates) - min(rates)) / baseline * 100
             st.dataframe(probe_rows, use_container_width=True, hide_index=True)
             st.metric("Variation in output per input across probes", f"{size_sensitivity:.3f}%" if size_sensitivity is not None else "Unavailable")
-            st.caption("This is a quote-size sensitivity signal from three RPC quotes, not an independently verified price-impact or MEV measurement. Larger quotes may differ due to pool curve and fee tier.")
+            st.caption("This is a quote-size sensitivity signal from three RPC quotes, not an independently verified price-impact or MEV measurement. It compares output-per-input across the tested sizes using the same token pair and fee tier.")
         except Exception as exc:
             probe_error = str(exc)
             st.warning(f"Quote succeeded, but size-sensitivity probes were incomplete: {probe_error}")
@@ -204,7 +207,21 @@ elif run_analysis:
             p.metric("Approx. reference output", f"{expected:,.8f} {token_out}")
             q.metric("Quote deviation", f"{deviation:+.3f}%")
             r.metric("Reference prices", f"${input_price:,.4f} / ${output_price:,.4f}")
-            st.caption(f"Reference prices fetched at {reference_time}. Data is cached for up to 20 seconds; this timestamp is the fetch time, not a guarantee that market data is real-time.")
+            st.caption(f"Reference prices retrieved at {reference_time}. The provider response used here does not supply a market-observation timestamp; this is retrieval time only. Results may be cached for up to 20 seconds.")
+            st.subheader("Reference-data quality checks")
+            quality_notes = []
+            if input_price <= 0 or output_price <= 0:
+                quality_notes.append("Reference price is zero or negative; do not rely on this comparison.")
+                st.error(quality_notes[-1])
+            elif abs(deviation) >= 5:
+                quality_notes.append("Quote/reference difference is 5% or more. Verify token mapping, pool route, liquidity, and reference data before interpreting it.")
+                st.warning(quality_notes[-1])
+            elif abs(deviation) >= 2:
+                quality_notes.append("Quote/reference difference is 2% or more. This may reflect market movement, fees, liquidity, or reference-data mismatch.")
+                st.warning(quality_notes[-1])
+            else:
+                quality_notes.append("Reference values are positive and quote/reference difference is below 2%; this is a consistency check, not proof that either price is correct.")
+                st.info(quality_notes[-1])
             score, label, reasons = assess(deviation, slippage, size_sensitivity)
             st.subheader("Pre-trade heuristic indicators")
             st.metric("Heuristic indicator score", f"{score}/100", label)
@@ -217,12 +234,35 @@ elif run_analysis:
             st.write("**Reasons considered**")
             for reason in reasons:
                 st.write("- " + reason)
-            st.caption("V4.3 uses reference-price deviation, selected slippage, and quote-size sensitivity only. It does not inspect liquidity depth directly, pending transactions, sandwich patterns, private order flow, or attack probability.")
+            st.caption("V4.4 uses reference-price deviation, selected slippage, and quote-size sensitivity only. Reference-data checks are sanity checks, not independent validation. It does not inspect liquidity depth directly, pending transactions, sandwich patterns, private order flow, or attack probability.")
+            report = {
+                "version": "V4.4",
+                "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "pair": f"{token_in}->{token_out}",
+                "pool_fee_tier": fee_label,
+                "input_amount": str(amount),
+                "slippage_percent": slippage,
+                "estimated_output": str(output),
+                "output_token": token_out,
+                "illustrative_minimum_output": str(minimum),
+                "quoter_gas_estimate": gas,
+                "quote_fetched_at_utc": quote_time.isoformat(timespec="seconds"),
+                "reference_retrieved_at_utc": reference_time,
+                "reference_prices_usd": {token_in: input_price, token_out: output_price},
+                "approx_reference_output": expected,
+                "quote_deviation_percent": deviation,
+                "quote_size_sensitivity_percent": size_sensitivity,
+                "heuristic_score": score,
+                "heuristic_label": label,
+                "reference_quality_notes": quality_notes,
+                "limitations": ["No wallet connection", "No transaction signing or submission", "No live mempool monitoring", "No verified MEV attack detection or prevention", "Reference timestamp is retrieval time, not market-observation time"]
+            }
+            st.download_button("Download test report (JSON)", data=json.dumps(report, indent=2), file_name="anti_mev_v4_4_test_report.json", mime="application/json")
         except Exception as exc:
             st.warning(f"Quote and size probes succeeded, but external-reference indicators could not be calculated: {exc}")
 
         st.subheader("Interpretation")
-        st.write("V4.3 adds a quote-size sensitivity check and timestamps for displayed quote/reference retrieval. It remains a transparent rule-based prototype, not AI-based detection. It does not submit transactions or prove MEV prevention.")
+        st.write("V4.4 adds reference-data sanity checks, an exportable JSON test report, quote-size sensitivity, and retrieval timestamps. It remains a transparent rule-based prototype, not AI-based detection. It does not submit transactions or prove MEV prevention.")
         st.caption(f"Pair: {token_in} → {token_out} • Fee tier: {fee_label} • Slippage: {slippage:.1f}%")
     except (InvalidOperation, ValueError, OverflowError) as exc:
         st.error(f"Enter a valid positive amount and valid HTTPS RPC URL. Details: {exc}")
@@ -250,4 +290,4 @@ if st.button("Inspect transaction", use_container_width=True):
             st.error(f"Transaction lookup failed: {exc}")
 
 st.divider()
-st.caption("Anti-MEV Shield V4.3 • Experimental proof of concept • No wallet connection, signing, transaction submission, private relay, or guaranteed MEV protection.")
+st.caption("Anti-MEV Shield V4.4 • Experimental proof of concept • No wallet connection, signing, transaction submission, private relay, or guaranteed MEV protection.")
